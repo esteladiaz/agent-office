@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Agent Keep</title>
+<style>
+  :root {
+    --bg: #15120e; --ink: #eadfc8; --muted: #a39478; --line: #3a3226; --gold: #d9a441;
+    --typing: #7fb2ff; --reading: #c7a2ff; --running: #8fe07a; --delegating: #f2c94c;
+    --thinking: #d8ccb0; --waiting: #ff9f5c; --blocked: #ff5f57; --done: #7d735f;
+    --serif: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 var(--serif); }
+  header { padding: 12px 16px 10px; border-bottom: 1px solid var(--line); }
+  .top { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .12em; color: var(--gold); font-variant: small-caps; }
+  #status { color: var(--muted); font-style: italic; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); margin-top: 6px; font-size: 13px; }
+  .legend b { color: var(--c); font-weight: normal; }
+  .legend b::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 5px; background: var(--c); }
+  .roles { color: var(--muted); font-size: 12px; margin-top: 4px; font-style: italic; }
+  #stage { padding: 16px; overflow-x: auto; }
+  canvas { display: block; image-rendering: pixelated; border: 1px solid var(--line); }
+  #empty { color: var(--muted); padding: 40px 16px; display: none; font-style: italic; }
+  table { width: calc(100% - 32px); margin: 0 16px 24px; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+  th { color: var(--muted); font-weight: normal; font-variant: small-caps; letter-spacing: .06em; }
+  td.state { color: var(--c); }
+  td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  tr.sub td:first-child { padding-left: 24px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>The Agent Keep</h1>
+    <span id="status">summoning…</span>
+  </div>
+  <div class="legend">
+    <b style="--c:var(--typing)">scribing</b><span>editing</span>
+    <b style="--c:var(--reading)">studying</b><span>reading/searching</span>
+    <b style="--c:var(--running)">conjuring</b><span>running commands</span>
+    <b style="--c:var(--delegating)">commanding</b><span>awaiting subagents</span>
+    <b style="--c:var(--waiting)">awaits thee</b><span>your turn</span>
+    <b style="--c:var(--blocked)">beset</b><span>stuck, permission?</span>
+  </div>
+  <div class="roles">Crowned monarch = session (<span style="color:#e0b35a">crimson carpet: Claude Code</span> · <span style="color:#c9ced6">blue carpet: Cursor</span>) · Knight = general-purpose · Ranger = Explore · Wizard = Plan · Monk = any other subagent</div>
+</header>
+<div id="stage"><canvas id="c"></canvas><div id="empty">The hall stands empty. Begin a Claude Code or Cursor agent and a new arrival shall pass through the gate.</div></div>
+<table><thead><tr><th>agent</th><th>house</th><th>project</th><th>state</th><th>tool</th><th>for</th></tr></thead><tbody id="rows"></tbody></table>
+
+<script>
+'use strict';
+// ---------- palette & helpers ----------
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const STATE_COLOR = s => css('--' + s) || css('--thinking');
+const STATE_WORD = {
+  typing: 'scribing', reading: 'studying', running: 'conjuring', delegating: 'commanding',
+  thinking: 'pondering', waiting: 'awaits thee', asleep: 'slumbering', blocked: 'beset', done: 'departing',
+};
+const SKIN = ['#f1c7a3', '#d9a27a', '#b07a52', '#8a5a3b', '#5e3b26', '#f5d6bd'];
+const HAIR = ['#2b1d14', '#5a3a1e', '#c8952d', '#8f2d1f', '#1c1c1c', '#d9d2c5'];
+const ROBE = ['#7a1f2b', '#2a3f8f', '#3f6b3a', '#8a6a2a', '#5b2a7a', '#6b4a2f', '#2f6f73'];
+const ROYAL = ['#8f1d2c', '#23408f', '#5b2a7a', '#1f5a3a'];
+const SERIF = css('--serif');
+function hash(s) { let h = 2166136261; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+function look(key) {
+  const h = hash(key);
+  return {
+    skin: SKIN[h % SKIN.length], hair: HAIR[(h >>> 4) % HAIR.length], robe: ROBE[(h >>> 8) % ROBE.length],
+    royal: ROYAL[(h >>> 12) % ROYAL.length], long: (h >>> 16) & 1, beard: (h >>> 17) & 1,
+  };
+}
+function roleOf(a) {
+  if (!a || a.kind === 'session') return 'monarch';
+  const t = (a.agentType || '').toLowerCase().replace(/[^a-z]/g, '');
+  return { explore: 'ranger', plan: 'wizard', generalpurpose: 'knight' }[t] || 'monk';
+}
+const ROLE_NAME = { monarch: 'Monarch', knight: 'Knight', ranger: 'Ranger', wizard: 'Wizard', monk: 'Monk' };
+// Each tool is its own house: carpet colors under the monarch's desk.
+const HOUSE = {
+  claude: { name: 'Claude Code', trim: '#d9a441', outer: '#7a1f2b', inner: '#8f2a36' },
+  cursor: { name: 'Cursor', trim: '#c9ced6', outer: '#1d2f66', inner: '#26407f' },
+};
+const houseOf = a => HOUSE[a?.source] || HOUSE.claude;
+const fmtDur = ms => ms < 60e3 ? Math.round(ms / 1e3) + 's' : ms < 3600e3 ? Math.round(ms / 60e3) + 'm' : (ms / 3600e3).toFixed(1) + 'h';
+
+// ---------- world layout (world pixels; drawn at integer scale) ----------
+const COL_W = 64, ROW_H = 64, WALL_H = 28, LEFT = 20, TOP = WALL_H + 10;
+const DOOR = { x: 10, y: WALL_H - 2 };
+const STUCK_MS = 10_000;
+
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+const world = document.createElement('canvas');
+const w = world.getContext('2d');
+
+/** Server snapshot, and client-side sprites (which outlive snapshots to walk out). */
+let snap = { agents: [] };
+const sprites = new Map();
+
+// Each session gets a row: its desk first, then its subagents' desks.
+function layout() {
+  const sessions = snap.agents.filter(a => a.kind === 'session')
+    .sort((a, b) => a.key.localeCompare(b.key));
+  const seats = new Map();
+  let row = 0, maxCols = 4;
+  for (const s of sessions) {
+    const subs = snap.agents.filter(a => a.kind === 'subagent' && a.sessionKey === s.key)
+      .sort((a, b) => a.key.localeCompare(b.key));
+    const perRow = 7;
+    seats.set(s.key, { col: 0, row });
+    subs.forEach((a, i) => seats.set(a.key, { col: 1 + (i % perRow), row: row + Math.floor(i / perRow) }));
+    maxCols = Math.max(maxCols, 1 + Math.min(subs.length, perRow));
+    row += Math.max(1, Math.ceil(subs.length / perRow));
+  }
+  return { seats, rows: Math.max(row, 1), cols: maxCols };
+}
+const deskXY = (seat) => ({ x: LEFT + seat.col * COL_W, y: TOP + seat.row * ROW_H });
+const seatXY = (seat) => { const d = deskXY(seat); return { x: d.x + 20, y: d.y + 26 }; };
+
+// ---------- drawing primitives ----------
+const px = (x, y, wd, ht, c) => { w.fillStyle = c; w.fillRect(Math.round(x), Math.round(y), wd, ht); };
+const glow = (x, y, wd, ht, c, alpha) => { w.globalAlpha = alpha; px(x, y, wd, ht, c); w.globalAlpha = 1; };
+/** Draw a tiny bitmap: rows of '#' (color) and '.' (skip). */
+function bits(x, y, rows, c) {
+  rows.forEach((r, j) => { for (let i = 0; i < r.length; i++) if (r[i] === '#') px(x + i, y + j, 1, 1, c); });
+}
+const flick = (t, seed, n) => hash(String(Math.floor(t / 110) + seed)) % n;
+
+// ---------- the hall ----------
+function drawRoom(W, H, t) {
+  px(0, 0, W, H, '#47423b');
+  // flagstone floor, staggered
+  for (let y = WALL_H, r = 0; y < H; y += 10, r++) {
+    for (let x = (r % 2) ? -8 : 0; x < W; x += 16) {
+      const v = hash(`${x},${r}`) % 3;
+      px(x, y, 16, 10, ['#4b463f', '#47423b', '#514b43'][v]);
+      px(x, y + 9, 16, 1, '#36322c'); px(x, y, 1, 10, '#36322c');
+    }
+  }
+  // stone brick wall
+  for (let y = 0, r = 0; y < WALL_H - 3; y += 6, r++) {
+    for (let x = (r % 2) ? -6 : 0; x < W; x += 12) {
+      px(x, y, 12, 6, ['#6a6660', '#625e58', '#6f6a63'][hash(`w${x},${r}`) % 3]);
+      px(x, y + 5, 12, 1, '#45423d'); px(x, y, 1, 6, '#45423d');
+    }
+  }
+  px(0, WALL_H - 3, W, 3, '#3a3631'); px(0, WALL_H - 3, W, 1, '#7a756d');
+  drawGate();
+  // banners and torches along the wall
+  for (let x = 40, i = 0; x < W - 44; x += 64, i++) {
+    drawBanner(x, i % 2 ? '#23408f' : '#8f1d2c');
+    drawTorch(x + 36, t);
+  }
+  // shield and crossed swords, and a barrel in the corner
+  const sx = W - 30;
+  for (let i = 0; i < 13; i++) { px(sx + i, 4 + i, 1, 1, '#c9ced6'); px(sx + 12 - i, 4 + i, 1, 1, '#c9ced6'); }
+  px(sx + 1, 14, 3, 1, '#8a6a2a'); px(sx + 9, 14, 3, 1, '#8a6a2a');
+  px(sx + 2, 7, 9, 9, '#d9a441'); px(sx + 3, 8, 7, 8, '#8f1d2c'); px(sx + 4, 16, 5, 2, '#8f1d2c'); px(sx + 5, 18, 3, 1, '#8f1d2c');
+  px(sx + 6, 9, 1, 7, '#d9a441'); px(sx + 4, 11, 5, 1, '#d9a441');
+  const bx = W - 16, by = WALL_H + 2;
+  px(bx, by, 10, 12, '#6b4526'); px(bx + 1, by, 8, 1, '#835633'); px(bx, by + 3, 10, 1, '#2b2b2b'); px(bx, by + 8, 10, 1, '#2b2b2b');
+}
+
+function drawGate() {
+  const x = DOOR.x;
+  px(x - 9, 2, 19, WALL_H - 3, '#8a857c'); // stone arch
+  px(x - 7, 5, 15, 1, '#8a857c');
+  px(x - 5, 5, 11, 2, '#2a1d12'); px(x - 7, 7, 15, WALL_H - 10, '#2a1d12'); // opening
+  px(x - 6, 7, 13, WALL_H - 10, '#5a3a22'); px(x - 4, 6, 9, 1, '#5a3a22'); // doors
+  for (let i = -5; i < 7; i += 3) px(x + i, 7, 1, WALL_H - 10, '#4a2f1b'); // planks
+  px(x - 6, 11, 13, 1, '#2b2b2b'); px(x - 6, 19, 13, 1, '#2b2b2b'); // iron bands
+  px(x, 7, 1, WALL_H - 10, '#2a1d12'); px(x - 2, 15, 1, 2, '#d9a441'); px(x + 2, 15, 1, 2, '#d9a441');
+}
+
+function drawBanner(x, color) {
+  px(x - 1, 3, 11, 1, '#d9a441');
+  px(x, 4, 9, 14, color); px(x, 18, 3, 2, color); px(x + 6, 18, 3, 2, color);
+  px(x + 8, 4, 1, 14, 'rgba(0,0,0,.25)');
+  bits(x + 2, 8, ['..#..', '.###.', '#####', '.#.#.'], '#d9a441');
+}
+
+function drawTorch(x, t) {
+  glow(x - 9, 1, 21, WALL_H - 3, '#ffb347', 0.07);
+  glow(x - 5, 4, 13, 18, '#ffb347', 0.08);
+  px(x, 13, 3, 2, '#2b2b2b'); px(x + 1, 11, 1, 3, '#5a3a22');
+  const f = flick(t, x, 3);
+  px(x, 8 - f % 2, 3, 3 + f % 2, '#e8712a'); px(x + 1, 9 - (f === 2 ? 1 : 0), 1, 2, '#ffd35c');
+}
+
+// ---------- a scribe's desk ----------
+function drawDesk(d, a, t) {
+  const lead = a && a.kind === 'session';
+  if (lead) { // royal carpet marks the session's desk
+    const h = houseOf(a);
+    px(d.x - 4, d.y - 2, 48, 37, h.trim); px(d.x - 3, d.y - 1, 46, 35, h.outer);
+    px(d.x - 1, d.y + 1, 42, 31, h.inner);
+  }
+  // oak desk + legs
+  px(d.x, d.y + 10, 40, 10, '#6b4526'); px(d.x, d.y + 10, 40, 2, '#835633'); px(d.x, d.y + 20, 40, 2, '#4e321b');
+  px(d.x + 1, d.y + 22, 2, 4, '#4e321b'); px(d.x + 37, d.y + 22, 2, 4, '#4e321b');
+  drawTome(d, a, t);
+  // candle
+  glow(d.x + 28, d.y + 1, 13, 14, '#ffb347', 0.10);
+  px(d.x + 32, d.y + 13, 6, 2, '#a88b4a'); px(d.x + 33, d.y + 7, 3, 6, '#efe6cf'); px(d.x + 35, d.y + 7, 1, 6, '#d7ccb0');
+  const f = flick(t, d.x + d.y, 3);
+  px(d.x + 34, d.y + 4 - (f % 2), 1, 3 + (f % 2), '#e8712a'); px(d.x + 34, d.y + 5, 1, 1, '#ffd35c');
+  // inkwell, with the quill in it unless someone is writing
+  px(d.x + 4, d.y + 11, 4, 3, '#1f1a24'); px(d.x + 5, d.y + 11, 2, 1, '#3b3445');
+  if (!a || visualState(a) !== 'typing') { px(d.x + 6, d.y + 4, 1, 7, '#f2efe6'); px(d.x + 7, d.y + 4, 1, 4, '#d9d4c8'); }
+}
+
+// The open tome on its stand is the "screen": what's on its pages shows the state.
+function drawTome(d, a, t) {
+  const x = d.x + 11, y = d.y - 3;
+  px(d.x + 19, d.y + 6, 2, 5, '#4e321b'); // stand
+  const st = a ? visualState(a) : 'done';
+  if (st === 'waiting' || st === 'asleep' || st === 'done') { // closed
+    px(x + 3, y + 2, 12, 9, '#5a2323'); px(x + 3, y + 2, 12, 1, '#7a3434'); px(x + 14, y + 5, 1, 3, '#d9a441');
+    return;
+  }
+  const col = STATE_COLOR(st);
+  glow(x - 2, y - 2, 22, 14, col, 0.18 + 0.1 * Math.sin(t / 250));
+  px(x, y, 18, 10, '#5a2323'); px(x + 1, y + 1, 8, 8, '#eadbb4'); px(x + 9, y + 1, 8, 8, '#e2d1a6'); px(x + 8, y, 2, 10, '#3d1818');
+  const ink = '#3b2a1a';
+  const step = Math.floor(t / 200);
+  if (st === 'typing') { // lines appear on the right page, fresh ink glows
+    for (let i = 0; i < 4; i++) px(x + 2, y + 2 + i * 2, 5 + (hash(a.key + i) % 2), 1, ink);
+    const n = step % 5;
+    for (let i = 0; i < n; i++) px(x + 10, y + 2 + i * 2, i === n - 1 ? 1 + (step % 3) * 2 : 6, 1, i === n - 1 ? col : ink);
+  } else if (st === 'reading') { // lines, plus a page turning over
+    for (let i = 0; i < 4; i++) { px(x + 2, y + 2 + i * 2, 5, 1, ink); px(x + 10, y + 2 + i * 2, 5, 1, ink); }
+    const ph = (t % 1600) / 1600;
+    if (ph < 0.5) {
+      const wd = Math.max(1, Math.round(7 * Math.abs(1 - 4 * ph)));
+      px(ph < 0.25 ? x + 10 : x + 9 - wd, y - 1, wd, 9, '#f6ecd0');
+    }
+  } else if (st === 'running') { // glowing runes and sparks
+    for (let i = 0; i < 14; i++) {
+      const s = hash(a.key + (Math.floor(t / 300) + i));
+      px(x + 2 + (s % 14) + (s % 14 > 5 ? 1 : 0), y + 2 + ((s >>> 5) % 6), 1, 1, i % 3 ? col : ink);
+    }
+    for (let i = 0; i < 3; i++) { const s = hash(a.key + 's' + (Math.floor(t / 180) + i)); px(x + 2 + s % 14, y - 2 - (s >>> 4) % 4, 1, 1, col); }
+  } else if (st === 'delegating') { // a campaign map
+    for (let i = 0; i < 5; i++) px(x + 2 + i * 3, y + 6 - (i % 2) * 3, 1, 1, '#8f1d2c');
+    bits(x + 13, y + 2, ['#.#', '.#.', '#.#'], ink);
+    if (Math.floor(t / 400) % 2) px(x + 2, y + 6, 1, 1, col);
+  } else { // pondering / beset: plain text
+    for (let i = 0; i < 4; i++) { px(x + 2, y + 2 + i * 2, 5, 1, ink); px(x + 10, y + 2 + i * 2, 4 + (i % 2) * 2, 1, ink); }
+    if (st === 'blocked' && Math.floor(t / 300) % 2) { px(x + 12, y + 5, 3, 3, '#b3202a'); px(x + 13, y + 6, 1, 1, '#e04a4a'); }
+  }
+}
+
+// ---------- people ----------
+// Seated, seen from behind (they face the tome, as do we).
+function drawSeated(p, lk, role, st, t, key) {
+  const bob = st === 'thinking' ? (Math.floor(t / 500) % 2) : 0;
+  if (role === 'monarch') { // throne
+    px(p.x - 8, p.y - 13, 16, 22, '#d9a441'); px(p.x - 7, p.y - 12, 14, 20, '#3d2616'); px(p.x - 6, p.y - 11, 12, 1, '#4e321b');
+    px(p.x - 9, p.y - 15, 3, 3, '#d9a441'); px(p.x + 6, p.y - 15, 3, 3, '#d9a441');
+  } else { // stool
+    px(p.x - 5, p.y + 2, 10, 2, '#6b4526'); px(p.x - 4, p.y + 4, 1, 4, '#4e321b'); px(p.x + 3, p.y + 4, 1, 4, '#4e321b');
+  }
+  // body: cape for the monarch, robe or tabard for everyone else
+  const bodyCol = role === 'monarch' ? lk.royal : role === 'knight' ? '#8d939c' : role === 'ranger' ? '#3f6b3a' : role === 'wizard' ? '#34407a' : role === 'monk' ? '#6b4a2f' : lk.robe;
+  px(p.x - 5, p.y - 6 + bob, 10, 9, bodyCol);
+  if (role === 'monarch') { px(p.x - 6, p.y - 6 + bob, 12, 2, '#f2efe6'); px(p.x - 4, p.y - 6 + bob, 1, 1, '#1c1c1c'); px(p.x + 2, p.y - 6 + bob, 1, 1, '#1c1c1c'); }
+  if (role === 'knight') px(p.x - 1, p.y - 5 + bob, 2, 7, lk.robe); // tabard stripe
+  // arms by state
+  const writing = st === 'typing';
+  const a1 = Math.floor(t / 130 + (hash(key) % 3)) % 2;
+  if (st === 'running') { // hands raised, casting
+    px(p.x - 8, p.y - 12 + bob, 2, 6, bodyCol); px(p.x + 6, p.y - 12 + bob, 2, 6, bodyCol);
+    px(p.x - 8, p.y - 13, 2, 1, lk.skin); px(p.x + 6, p.y - 13, 2, 1, lk.skin);
+    if (a1) { px(p.x - 7, p.y - 15, 1, 1, css('--running')); px(p.x + 7, p.y - 16, 1, 1, css('--running')); }
+  } else if (st === 'delegating') { // pointing with a scepter
+    px(p.x - 7, p.y - 6, 2, 6, bodyCol);
+    px(p.x + 5, p.y - 6, 5, 2, bodyCol); px(p.x + 10, p.y - 6, 1, 2, lk.skin);
+    px(p.x + 10, p.y - 11, 1, 6, '#d9a441'); px(p.x + 9, p.y - 12, 3, 2, '#b3202a');
+  } else {
+    px(p.x - 7, p.y - 7 + bob, 2, 6, bodyCol);
+    px(p.x + 5, p.y - 7 - (writing ? a1 : 0) + bob, 2, 6, bodyCol);
+    if (writing) { px(p.x + 6, p.y - 11 - a1, 1, 4, '#f2efe6'); }
+  }
+  drawHeadBack(p.x, p.y - 14 + bob, lk, role, t);
+  if (st === 'reading') { // unrolled scroll held to one side
+    px(p.x + 6, p.y - 13, 7, 1, '#c9b27f'); px(p.x + 6, p.y - 12, 7, 7, '#efe2c2'); px(p.x + 6, p.y - 5, 7, 1, '#c9b27f');
+    for (let i = 0; i < 3; i++) px(p.x + 7, p.y - 11 + i * 2, 5, 1, '#8a7a5a');
+  }
+}
+
+/** Head from behind; (x, y) is the top-center of the skull. */
+function drawHeadBack(x, y, lk, role) {
+  px(x - 4, y, 8, 8, lk.hair); px(x - 4, y + 5, 1, 2, lk.skin); px(x + 3, y + 5, 1, 2, lk.skin);
+  if (lk.long && role !== 'knight') px(x - 4, y + 7, 8, 3, lk.hair);
+  drawHeadgear(x, y, lk, role, false);
+}
+
+function drawHeadgear(x, y, lk, role, front) {
+  switch (role) {
+    case 'monarch':
+      px(x - 4, y - 1, 8, 2, '#d9a441');
+      px(x - 4, y - 3, 1, 2, '#d9a441'); px(x - 1, y - 4, 2, 3, '#d9a441'); px(x + 3, y - 3, 1, 2, '#d9a441');
+      px(x, y - 1, 1, 1, '#b3202a'); px(x - 3, y, 1, 1, '#2a6fdb'); px(x + 2, y, 1, 1, '#2a6fdb');
+      break;
+    case 'knight':
+      px(x - 4, y - 1, 8, 9, '#a7adb7'); px(x - 4, y - 1, 8, 1, '#c9ced6'); px(x + 3, y, 1, 7, '#868c96');
+      if (front) { px(x - 3, y + 3, 6, 1, '#1c1c1c'); px(x, y + 4, 1, 3, '#868c96'); }
+      px(x - 1, y - 4, 2, 3, '#b3202a'); px(x + 1, y - 3, 2, 1, '#b3202a');
+      break;
+    case 'ranger':
+    case 'monk': {
+      const c = role === 'ranger' ? '#3f6b3a' : '#6b4a2f', dk = role === 'ranger' ? '#2f5229' : '#523823';
+      if (front) { px(x - 5, y - 1, 10, 3, c); px(x - 5, y + 2, 2, 7, c); px(x + 3, y + 2, 2, 7, c); px(x - 3, y + 2, 6, 1, dk); }
+      else { px(x - 5, y - 1, 10, 10, c); px(x + 3, y, 1, 9, dk); px(x - 1, y - 3, 2, 2, c); }
+      break;
+    }
+    case 'wizard':
+      px(x - 6, y + 1, 12, 2, '#34407a');
+      px(x - 4, y - 2, 8, 3, '#34407a'); px(x - 3, y - 5, 6, 3, '#34407a'); px(x - 2, y - 8, 4, 3, '#34407a');
+      px(x - 1, y - 10, 2, 2, '#34407a'); px(x + 1, y - 11, 2, 1, '#34407a');
+      px(x - 1, y - 3, 1, 1, '#f2c94c'); px(x + 1, y - 6, 1, 1, '#f2c94c');
+      if (front && lk.beard) { px(x - 3, y + 6, 7, 4, '#e8e4dc'); px(x - 2, y + 10, 5, 1, '#e8e4dc'); }
+      break;
+  }
+}
+
+// Walking, seen from the front.
+function drawWalking(p, lk, role, t) {
+  const f = Math.floor(t / 140) % 2;
+  const bodyCol = role === 'monarch' ? lk.royal : role === 'knight' ? '#8d939c' : role === 'ranger' ? '#3f6b3a' : role === 'wizard' ? '#34407a' : '#6b4a2f';
+  px(p.x - 3, p.y - 1, 2, 5 - f, '#3a2f28'); px(p.x + 1, p.y - 1, 2, 4 + f, '#3a2f28');
+  px(p.x - 3, p.y + 3 - f, 2, 1, '#1f1a16'); px(p.x + 1, p.y + 3 + f - 1 + 1, 2, 1, '#1f1a16');
+  if (role === 'monarch') { px(p.x - 6, p.y - 8, 12, 9, lk.royal); px(p.x - 6, p.y - 8, 12, 2, '#f2efe6'); }
+  px(p.x - 4, p.y - 8, 8, 8, role === 'monarch' ? lk.robe : bodyCol);
+  if (role === 'knight') px(p.x - 1, p.y - 7, 2, 7, lk.robe);
+  if (role === 'wizard' || role === 'monk') px(p.x - 4, p.y - 2, 8, 3, bodyCol); // long robe
+  px(p.x - 5, p.y - 7 + f, 1, 5, bodyCol); px(p.x + 4, p.y - 6 - f, 1, 5, bodyCol);
+  px(p.x - 3, p.y - 15, 7, 7, lk.skin);
+  if (role !== 'knight') { px(p.x - 4, p.y - 16, 8, 2, lk.hair); if (lk.long) { px(p.x - 4, p.y - 14, 1, 5, lk.hair); px(p.x + 3, p.y - 14, 1, 5, lk.hair); } }
+  px(p.x - 2, p.y - 12, 1, 1, '#1a1a1a'); px(p.x + 1, p.y - 12, 1, 1, '#1a1a1a');
+  drawHeadgear(p.x, p.y - 15, lk, role, true);
+}
+
+// ---------- speech bubbles: small parchment with a pixel icon ----------
+const ICONS = {
+  waiting: { c: '#d9a441', rows: ['..#..', '.###.', '.###.', '.###.', '#####', '..#..'] }, // bell
+  blocked: { c: '#b3202a', rows: ['.#.', '.#.', '.#.', '.#.', '...', '.#.'] },
+  asleep: { c: '#7d735f', rows: ['####', '..#.', '.#..', '####'] },
+  thinking: { c: '#6b5a42', rows: ['.....', '.....', '#.#.#'] },
+  delegating: { c: '#8f1d2c', rows: ['####', '###.', '####', '#...', '#...', '#...'] }, // banner
+};
+function drawBubble(p, kind, t) {
+  const ic = ICONS[kind]; if (!ic) return;
+  const x = p.x + 8, y = p.y - 26 - (Math.floor(t / 400) % 2);
+  px(x, y, 11, 10, '#a8916a'); px(x + 1, y + 1, 9, 8, '#efe2c2'); px(x - 2, y + 8, 3, 2, '#a8916a'); px(x - 1, y + 8, 2, 1, '#efe2c2');
+  const wd = Math.max(...ic.rows.map(r => r.length));
+  bits(x + 1 + Math.floor((9 - wd) / 2), y + 1 + Math.floor((8 - ic.rows.length) / 2), ic.rows, ic.c);
+}
+
+function visualState(a) {
+  if (a.state === 'waiting' && a.idleForMs > 10 * 60e3) return 'asleep';
+  if (a.pendingForMs > STUCK_MS && a.state !== 'delegating' && a.state !== 'waiting' && a.state !== 'done') return 'blocked';
+  return a.state;
+}
+
+// ---------- sprite motion ----------
+function syncSprites(seats) {
+  for (const a of snap.agents) {
+    const seat = seats.get(a.key);
+    const target = seatXY(seat);
+    let s = sprites.get(a.key);
+    if (!s) {
+      // Agents already working when the page loads start seated; new ones walk in.
+      const arriving = loadedOnce;
+      s = { key: a.key, pos: arriving ? { ...DOOR } : { ...target }, path: [], leaving: false };
+      sprites.set(a.key, s);
+    }
+    s.agent = a; s.seat = seat; s.leaving = false;
+    const goal = s.path.length ? s.path[s.path.length - 1] : s.pos;
+    if (goal.x !== target.x || goal.y !== target.y) s.path = route(s.pos, target);
+  }
+  for (const [key, s] of sprites) {
+    if (!snap.agents.some(a => a.key === key) && !s.leaving) {
+      s.leaving = true; s.agent = { ...s.agent, state: 'done' }; s.path = route(s.pos, DOOR);
+    }
+  }
+}
+// Walk down to the aisle under the row, across, then up/down into place.
+function route(from, to) {
+  const aisle = (y) => y + 14;
+  if (Math.abs(from.x - to.x) < 1 && Math.abs(from.y - to.y) < 1) return [];
+  const pts = [];
+  const fromAisle = from.y <= WALL_H + 2 ? WALL_H + 4 : aisle(from.y);
+  pts.push({ x: from.x, y: fromAisle });
+  const toAisle = to.y <= WALL_H + 2 ? WALL_H + 4 : aisle(to.y);
+  pts.push({ x: LEFT - 8, y: fromAisle }, { x: LEFT - 8, y: toAisle }, { x: to.x, y: toAisle }, { ...to });
+  return pts;
+}
+function step(dt) {
+  const speed = 48; // world px / s
+  for (const [key, s] of sprites) {
+    let budget = speed * dt;
+    while (budget > 0 && s.path.length) {
+      const n = s.path[0];
+      const dx = n.x - s.pos.x, dy = n.y - s.pos.y, dist = Math.hypot(dx, dy);
+      if (dist <= budget) { s.pos = { ...n }; s.path.shift(); budget -= dist; }
+      else { s.pos.x += dx / dist * budget; s.pos.y += dy / dist * budget; budget = 0; }
+    }
+    if (s.leaving && !s.path.length) sprites.delete(key);
+  }
+}
+
+// ---------- frame ----------
+let loadedOnce = false, lastT = performance.now();
+function frame(t) {
+  // Background tabs throttle rAF hard, so walking is paced by wall time, not frames.
+  const dt = Math.min(5, (t - lastT) / 1000); lastT = t;
+  const { seats, rows, cols } = layout();
+  syncSprites(seats);
+  step(dt);
+
+  const W = Math.max(LEFT + cols * COL_W + 20, 320), H = TOP + rows * ROW_H + 8;
+  const avail = Math.max(320, document.getElementById('stage').clientWidth - 34);
+  const scale = Math.max(1, Math.min(4, Math.floor(avail / W)));
+  const dpr = window.devicePixelRatio || 1;
+  if (world.width !== W || world.height !== H) { world.width = W; world.height = H; }
+  const cw = W * scale, ch = H * scale;
+  if (cvs.width !== cw * dpr || cvs.height !== ch * dpr) {
+    cvs.width = cw * dpr; cvs.height = ch * dpr; cvs.style.width = cw + 'px'; cvs.style.height = ch + 'px';
+  }
+
+  drawRoom(W, H, t);
+  // desks first, then people back-to-front so heads overlap desks below them
+  for (const a of snap.agents) drawDesk(deskXY(seats.get(a.key)), a, t);
+  const ordered = [...sprites.values()].sort((a, b) => a.pos.y - b.pos.y);
+  for (const s of ordered) {
+    const lk = look(s.key), role = roleOf(s.agent);
+    if (!s.path.length && !s.leaving) {
+      const st = visualState(s.agent);
+      drawSeated(s.pos, lk, role, st, t, s.key);
+      drawBubble(s.pos, st, t);
+    } else drawWalking(s.pos, lk, role, t);
+  }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(world, 0, 0, cvs.width, cvs.height);
+
+  // Labels are drawn at device resolution so they stay crisp.
+  const k = scale * dpr;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.shadowColor = 'rgba(0,0,0,.8)'; ctx.shadowOffsetY = dpr;
+  for (const a of snap.agents) {
+    const d = deskXY(seats.get(a.key));
+    const cx = (d.x + 20) * k, y = (d.y + 36) * k, maxW = (COL_W - 2) * k;
+    const st = visualState(a);
+    const role = roleOf(a);
+    const name = a.kind === 'session' ? (a.title || a.project || 'session') : ROLE_NAME[role];
+    const sub = a.kind === 'session' ? `${a.project} · ${houseOf(a).name}` : (a.title || a.agentType || '');
+    ctx.font = `${a.kind === 'session' ? 'bold ' : ''}${Math.round(12 * dpr)}px ${SERIF}`;
+    ctx.fillStyle = a.kind === 'session' ? houseOf(a).trim : css('--ink'); ctx.fillText(clip(name, maxW), cx, y);
+    ctx.font = `italic ${Math.round(11 * dpr)}px ${SERIF}`;
+    ctx.fillStyle = css('--muted'); ctx.fillText(clip(sub, maxW), cx, y + 13 * dpr);
+    ctx.font = `${Math.round(11 * dpr)}px ${SERIF}`;
+    ctx.fillStyle = STATE_COLOR(st === 'asleep' ? 'done' : st); ctx.fillText(clip(statusLabel(a, st), maxW), cx, y + 26 * dpr);
+  }
+  ctx.shadowColor = 'transparent';
+  requestAnimationFrame(frame);
+}
+function clip(text, maxW) {
+  if (!text) return '';
+  if (ctx.measureText(text).width <= maxW) return text;
+  while (text.length > 1 && ctx.measureText(text + '…').width > maxW) text = text.slice(0, -1);
+  return text + '…';
+}
+function statusLabel(a, st) {
+  if (st === 'blocked') return `beset by ${a.tool} ${fmtDur(a.pendingForMs)} · needs thy leave?`;
+  if (st === 'waiting') return `awaits thee · ${fmtDur(a.idleForMs)}`;
+  if (st === 'asleep') return `slumbering ${fmtDur(a.idleForMs)}`;
+  if (st === 'delegating') {
+    const n = snap.agents.filter(x => x.parentKey === a.key && x.state !== 'done').length;
+    return n ? `commanding ${n} retainer${n === 1 ? '' : 's'}` : 'commanding';
+  }
+  const word = STATE_WORD[st] || st;
+  if (a.tool) return `${word} · ${a.tool.replace(/^mcp__.+?__/, 'mcp:')}`;
+  return word;
+}
+
+// ---------- table ----------
+function renderTable() {
+  const rows = document.getElementById('rows');
+  const sessions = snap.agents.filter(a => a.kind === 'session').sort((a, b) => a.key.localeCompare(b.key));
+  const html = [];
+  const row = (a, cls) => {
+    const st = visualState(a);
+    const name = a.kind === 'session' ? (a.title || '(untitled)') : `${ROLE_NAME[roleOf(a)]} (${a.agentType || 'agent'}): ${a.title}`;
+    const dur = a.pendingForMs ? fmtDur(a.pendingForMs) : fmtDur(a.idleForMs);
+    html.push(`<tr class="${cls}"><td title="${esc(name)}">${esc(name)}</td><td style="color:${houseOf(a).trim}">${houseOf(a).name}</td><td>${esc(a.project)}${a.branch ? ' <span style="color:var(--muted)">' + esc(a.branch) + '</span>' : ''}</td><td class="state" style="--c:${STATE_COLOR(st === 'asleep' ? 'done' : st)}">${STATE_WORD[st] || st}</td><td class="mono">${esc(a.tool || '')}</td><td>${dur}</td></tr>`);
+  };
+  for (const s of sessions) {
+    row(s, '');
+    for (const a of snap.agents.filter(x => x.kind === 'subagent' && x.sessionKey === s.key)) row(a, 'sub');
+  }
+  rows.innerHTML = html.join('');
+  document.getElementById('empty').style.display = sessions.length ? 'none' : 'block';
+  cvs.style.display = sessions.length ? 'block' : 'none';
+}
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ---------- live data ----------
+const statusEl = document.getElementById('status');
+function connect() {
+  const es = new EventSource('/events');
+  es.onmessage = (e) => {
+    snap = JSON.parse(e.data);
+    const n = snap.agents.filter(a => a.kind === 'session').length, m = snap.agents.length - n;
+    statusEl.textContent = `${n} session${n === 1 ? '' : 's'} · ${m} subagent${m === 1 ? '' : 's'} · live`;
+    renderTable();
+    if (!loadedOnce) { syncSprites(layout().seats); loadedOnce = true; }
+  };
+  es.onerror = () => { statusEl.textContent = 'the messenger is lost — is server.mjs running? retrying…'; };
+}
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
