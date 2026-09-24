@@ -476,6 +476,20 @@ async function hydrateCloudAgent(a) {
   }
 }
 
+async function listCloudAgents() {
+  const items = [];
+  let cursor = null;
+  do {
+    const query = new URLSearchParams({ limit: '100', includeArchived: 'false' });
+    if (cursor) query.set('cursor', cursor);
+    const response = await cloudRequest(`/v1/agents?${query}`);
+    const body = await response.json();
+    if (Array.isArray(body.items)) items.push(...body.items);
+    cursor = typeof body.nextCursor === 'string' && body.nextCursor ? body.nextCursor : null;
+  } while (cursor);
+  return items;
+}
+
 function stopCloudWatch(key) {
   const watch = cloudWatches.get(key);
   if (!watch) return;
@@ -576,10 +590,9 @@ async function pollCloudAgents() {
   if (!CURSOR_API_KEY || cloudPollInFlight) return;
   cloudPollInFlight = true;
   try {
-    const response = await cloudRequest('/v1/agents?limit=100&includeArchived=false');
-    const body = await response.json();
-    const items = Array.isArray(body.items) ? body.items : [];
+    const items = await listCloudAgents();
     const seen = new Set();
+    const currentRuns = new Set();
     for (const item of items) {
       if (item.env?.type !== 'cloud' || !item.id) continue;
       const updatedAt = Date.parse(item.updatedAt) || 0;
@@ -588,8 +601,12 @@ async function pollCloudAgents() {
       seen.add(a.key);
       void hydrateCloudAgent(a);
       if (item.status === 'ACTIVE' && item.latestRunId) {
-        if (a.state === 'waiting') { a.state = 'thinking'; a.tool = null; }
-        void watchCloudRun(a, item.latestRunId);
+        const runKey = `${a.id}/${item.latestRunId}`;
+        currentRuns.add(runKey);
+        if (!finishedCloudRuns.has(runKey)) {
+          if (a.state === 'waiting') { a.state = 'thinking'; a.tool = null; }
+          void watchCloudRun(a, item.latestRunId);
+        }
       } else {
         stopCloudWatch(a.key);
         if (item.status === 'IDLE') finishTurn(a, updatedAt || Date.now());
@@ -599,8 +616,12 @@ async function pollCloudAgents() {
       if (a.source === 'cloud' && !seen.has(key)) {
         stopCloudWatch(key);
         agents.delete(key);
+        hydratedCloudAgents.delete(a.id);
         dirty = true;
       }
+    }
+    for (const runKey of finishedCloudRuns) {
+      if (!currentRuns.has(runKey)) finishedCloudRuns.delete(runKey);
     }
   } finally {
     cloudPollInFlight = false;

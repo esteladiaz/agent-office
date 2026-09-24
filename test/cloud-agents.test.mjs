@@ -129,4 +129,13 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
     assert.equal(agent.branch, 'cursor/cloud-poller');
     assert.doesNotMatch(JSON.stringify(state), /must not leak|secret\.txt/);
   });
+
+  // Discovery can lag behind the run stream. A stale ACTIVE status must not
+  // move a terminal run back from waiting to thinking on the next poll.
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const settled = await (await fetch(stateUrl)).json();
+  assert.equal(
+    settled.agents.find(candidate => candidate.key === `cloud:${AGENT_ID}`).state,
+    'waiting',
+  );
 });
