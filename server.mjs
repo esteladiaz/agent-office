@@ -472,7 +472,7 @@ async function hydrateCloudAgent(a) {
     dirty = true;
   } catch (err) {
     hydratedCloudAgents.delete(a.id);
-    console.warn(`Cursor Cloud metadata for ${a.id} failed: ${err.message}`);
+    reportCloudPoll(`metadata for ${a.id} failed: ${err.message}`);
   }
 }
 
@@ -488,6 +488,14 @@ async function listCloudAgents() {
     cursor = typeof body.nextCursor === 'string' && body.nextCursor ? body.nextCursor : null;
   } while (cursor);
   return items;
+}
+
+// One line per change, so a quiet hall says why without flooding the log.
+let lastCloudReport = '';
+function reportCloudPoll(message) {
+  if (message === lastCloudReport) return;
+  lastCloudReport = message;
+  console.log(`cursor-cloud: ${message}`);
 }
 
 function stopCloudWatch(key) {
@@ -593,10 +601,11 @@ async function pollCloudAgents() {
     const items = await listCloudAgents();
     const seen = new Set();
     const currentRuns = new Set();
+    let hidden = 0;
     for (const item of items) {
-      if (item.env?.type !== 'cloud' || !item.id) continue;
+      if (!item.id) continue;
       const updatedAt = Date.parse(item.updatedAt) || 0;
-      if (item.status !== 'ACTIVE' && Date.now() - updatedAt > ACTIVE_MS) continue;
+      if (item.status !== 'ACTIVE' && Date.now() - updatedAt > ACTIVE_MS) { hidden++; continue; }
       const a = ensureCloudAgent(item);
       seen.add(a.key);
       void hydrateCloudAgent(a);
@@ -623,6 +632,13 @@ async function pollCloudAgents() {
     for (const runKey of finishedCloudRuns) {
       if (!currentRuns.has(runKey)) finishedCloudRuns.delete(runKey);
     }
+    reportCloudPoll(`${items.length} agent(s) from the API, ${seen.size} in the hall` +
+      (hidden ? `, ${hidden} quiet longer than ${ACTIVE_MS / 60_000}m (raise ACTIVE_MINUTES to see them)` : ''));
+  } catch (err) {
+    const hint = err.status === 401 || err.status === 403
+      ? ' — check CURSOR_API_KEY in Cursor Dashboard → API Keys'
+      : '';
+    reportCloudPoll(`request failed: ${err.message}${hint}`);
   } finally {
     cloudPollInFlight = false;
   }

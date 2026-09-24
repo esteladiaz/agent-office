@@ -52,6 +52,7 @@ node demo.mjs            # open http://127.0.0.1:7332, re-run to replay
 - Live state: `GET /v1/agents/<id>/runs/<runId>/stream`, resumed with `Last-Event-ID` after a disconnect.
 - The run stream supplies tool names and completion states, so the same tome animations work without copying cloud transcripts to disk.
 - Cloud agents have purple carpets. Finished runs wait at their desks until the normal activity window expires.
+- The server prints one `cursor-cloud:` line whenever the picture changes: how many agents the API returned, how many reached the hall, how many were too quiet for `ACTIVE_MINUTES`, and why a request failed. An empty hall with a live key is almost always the quiet-agent window, so raise `ACTIVE_MINUTES`.
 
 ## Who's who
 

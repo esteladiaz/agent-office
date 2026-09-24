@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const API_KEY = 'test-key';
 const AGENT_ID = 'bc-00000000-0000-0000-0000-000000000001';
+const PLAIN_AGENT_ID = 'bc-00000000-0000-0000-0000-000000000002';
 const RUN_ID = 'run-00000000-0000-0000-0000-000000000001';
 
 const listen = async (server) => {
@@ -36,14 +37,23 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
     if (url.pathname === '/v1/agents') {
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({
-        items: [{
-          id: AGENT_ID,
-          name: 'Cloud poller test',
-          status: 'ACTIVE',
-          env: { type: 'cloud' },
-          latestRunId: RUN_ID,
-          updatedAt: new Date().toISOString(),
-        }],
+        items: [
+          {
+            id: AGENT_ID,
+            name: 'Cloud poller test',
+            status: 'ACTIVE',
+            env: { type: 'cloud' },
+            latestRunId: RUN_ID,
+            updatedAt: new Date().toISOString(),
+          },
+          // Agents without an env block must still reach the hall.
+          {
+            id: PLAIN_AGENT_ID,
+            name: 'Cloud agent without env',
+            status: 'IDLE',
+            updatedAt: new Date().toISOString(),
+          },
+        ],
       }));
       return;
     }
@@ -53,6 +63,11 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
         id: AGENT_ID,
         repos: [{ url: 'https://github.com/esteladiaz/agent-office' }],
       }));
+      return;
+    }
+    if (url.pathname === `/v1/agents/${PLAIN_AGENT_ID}`) {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ id: PLAIN_AGENT_ID, repos: [] }));
       return;
     }
     if (url.pathname === `/v1/agents/${AGENT_ID}/runs/${RUN_ID}/stream`) {
@@ -107,6 +122,14 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
   });
   assert.equal(reading.source, 'cloud');
   assert.equal(reading.title, 'Cloud poller test');
+
+  const plain = await eventually(async () => {
+    const state = await (await fetch(stateUrl)).json();
+    const agent = state.agents.find(candidate => candidate.key === `cloud:${PLAIN_AGENT_ID}`);
+    assert.ok(agent, childOutput);
+    return agent;
+  });
+  assert.equal(plain.state, 'waiting');
 
   await eventually(() => {
     assert.ok(stream);
