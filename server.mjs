@@ -13,13 +13,17 @@ const HOME = os.homedir();
 const CLAUDE_ROOT = process.env.CLAUDE_PROJECTS_DIR || path.join(HOME, '.claude', 'projects');
 const CURSOR_ROOT = process.env.CURSOR_PROJECTS_DIR || path.join(HOME, '.cursor', 'projects');
 const CURSOR_DB = process.env.CURSOR_STATE_DB ?? defaultCursorDb();
+const CURSOR_API_KEY = process.env.CURSOR_API_KEY || '';
+const CURSOR_API_BASE_URL = process.env.CURSOR_API_BASE_URL || 'https://api.cursor.com';
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 7331);
 const SCAN_MS = 700;
+const CLOUD_POLL_MS = Number(process.env.CLOUD_POLL_MS || 10_000);
 const ACTIVE_MS = Number(process.env.ACTIVE_MINUTES || 30) * 60_000; // hide sessions quiet longer than this
 const TAIL_BYTES = 512 * 1024; // first read of an existing file only looks at its tail
 const DONE_LINGER_MS = 6_000; // finished subagents stay visible briefly before walking out
 const TITLE_REFRESH_MS = 60_000;
+const CLOUD_RECONNECT_MS = 1_000;
 
 const INDEX_HTML = path.join(path.dirname(fileURLToPath(import.meta.url)), 'index.html');
 
@@ -41,8 +45,15 @@ const agents = new Map();
 const spawnedBy = new Map();
 /** Finished agent key -> file size when it finished; revived only if the file grows. */
 const tombstones = new Map();
+/** Cloud session key -> active run stream. */
+const cloudWatches = new Map();
+/** Terminal cloud runs must not reconnect while the agent list catches up. */
+const finishedCloudRuns = new Set();
+/** Cloud agents whose durable metadata (repository) has been loaded. */
+const hydratedCloudAgents = new Set();
 
 let dirty = true;
+let cloudPollInFlight = false;
 
 // ---------- transcript discovery ----------
 
@@ -142,7 +153,7 @@ function readNewLines(t) {
 /**
  * @typedef {Object} Agent
  * @property {string} key
- * @property {'claude'|'cursor'} source
+ * @property {'claude'|'cursor'|'cloud'} source
  * @property {'session'|'subagent'} kind
  * @property {string} sessionKey
  * @property {string|null} parentKey
@@ -166,11 +177,15 @@ const TOOL_STATE = {
   Agent: 'delegating', Task: 'delegating',
   AskUserQuestion: 'waiting', ExitPlanMode: 'waiting', AskQuestion: 'waiting',
   TodoWrite: 'thinking', UpdateCurrentStep: 'thinking', CreatePlan: 'thinking',
+  read_file: 'reading', codebase_search: 'reading', grep: 'reading', glob: 'reading', web_search: 'reading',
+  apply_patch: 'typing', edit_file: 'typing', write_file: 'typing', delete_file: 'typing',
+  run_terminal_cmd: 'running', shell: 'running',
+  spawn_subagent: 'delegating', task: 'delegating',
 };
 
 function stateForTool(name) {
   if (TOOL_STATE[name]) return TOOL_STATE[name];
-  if (name.startsWith('mcp__')) return 'reading';
+  if (name.startsWith('mcp__') || name.toLowerCase() === 'mcp') return 'reading';
   return 'running';
 }
 
@@ -393,6 +408,205 @@ function refreshCursorTitle(a, now) {
   if (!a.title && a.kind === 'session') a.title = `Cursor chat ${a.id.slice(0, 8)}`;
 }
 
+// ---------- Cursor Cloud API ----------
+
+function cloudApiUrl(route) {
+  const base = new URL(CURSOR_API_BASE_URL);
+  const loopback = base.hostname === '127.0.0.1' || base.hostname === 'localhost' || base.hostname === '::1';
+  if (base.protocol !== 'https:' && !loopback) throw new Error('CURSOR_API_BASE_URL must use HTTPS');
+  return new URL(route, base);
+}
+
+async function cloudRequest(route, options = {}) {
+  const headers = new Headers(options.headers);
+  headers.set('authorization', `Basic ${Buffer.from(`${CURSOR_API_KEY}:`).toString('base64')}`);
+  const response = await fetch(cloudApiUrl(route), { ...options, headers });
+  if (!response.ok) {
+    const error = new Error(`Cursor Cloud API ${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
+  }
+  return response;
+}
+
+function cloudProject(agent) {
+  const raw = agent.repos?.[0]?.url;
+  if (!raw) return 'Cursor Cloud';
+  try { return path.basename(new URL(raw).pathname.replace(/\.git$/, '')) || 'Cursor Cloud'; }
+  catch { return path.basename(raw.replace(/\.git$/, '')) || 'Cursor Cloud'; }
+}
+
+function ensureCloudAgent(item) {
+  const key = `cloud:${item.id}`;
+  let a = agents.get(key);
+  if (!a) {
+    a = {
+      key, source: 'cloud', file: null, kind: 'session', sessionKey: key, parentKey: null, id: item.id,
+      project: 'Cursor Cloud', title: item.name || `Cloud agent ${item.id.slice(0, 8)}`,
+      agentType: null, branch: null, state: item.status === 'ACTIVE' ? 'thinking' : 'waiting',
+      tool: null, pending: new Map(), lastTs: Date.parse(item.updatedAt) || Date.now(), doneAt: null,
+    };
+    agents.set(key, a);
+    dirty = true;
+  }
+  const runChanged = a.cloudRunId && item.latestRunId && a.cloudRunId !== item.latestRunId;
+  if (runChanged) {
+    a.pending.clear();
+    a.state = 'thinking';
+    a.tool = null;
+  }
+  a.title = item.name || a.title;
+  a.cloudStatus = item.status;
+  a.cloudRunId = item.latestRunId || null;
+  a.lastTs = Math.max(a.lastTs, Date.parse(item.updatedAt) || 0);
+  return a;
+}
+
+async function hydrateCloudAgent(a) {
+  if (hydratedCloudAgents.has(a.id)) return;
+  hydratedCloudAgents.add(a.id);
+  try {
+    const response = await cloudRequest(`/v1/agents/${encodeURIComponent(a.id)}`);
+    const detail = await response.json();
+    a.project = cloudProject(detail);
+    dirty = true;
+  } catch (err) {
+    hydratedCloudAgents.delete(a.id);
+    console.warn(`Cursor Cloud metadata for ${a.id} failed: ${err.message}`);
+  }
+}
+
+function stopCloudWatch(key) {
+  const watch = cloudWatches.get(key);
+  if (!watch) return;
+  watch.stopped = true;
+  watch.controller?.abort();
+  cloudWatches.delete(key);
+}
+
+function applyCloudEvent(a, event, data) {
+  a.lastTs = Date.now();
+  if (event === 'thinking' || event === 'assistant') {
+    if (!a.pending.size) { a.state = 'thinking'; a.tool = null; }
+  } else if (event === 'tool_call') {
+    if (!data.callId || !data.name) return false;
+    if (data.status === 'running') {
+      a.pending.set(data.callId, { name: data.name, ts: Date.now() });
+      setTool(a, data.name);
+    } else if (data.status === 'completed') {
+      a.pending.delete(data.callId);
+      if (a.pending.size) setTool(a, [...a.pending.values()].at(-1).name);
+      else { a.state = 'thinking'; a.tool = null; }
+    }
+  } else if (event === 'result') {
+    const branch = data.git?.branches?.[0];
+    if (branch?.repoUrl) a.project = path.basename(branch.repoUrl.replace(/\.git$/, ''));
+    if (branch?.branch) a.branch = branch.branch;
+    finishTurn(a, Date.now());
+    finishedCloudRuns.add(`${a.id}/${data.runId || a.cloudRunId}`);
+    dirty = true;
+    return true;
+  } else if (event === 'done') {
+    finishTurn(a, Date.now());
+    finishedCloudRuns.add(`${a.id}/${a.cloudRunId}`);
+    dirty = true;
+    return true;
+  }
+  dirty = true;
+  return false;
+}
+
+async function consumeCloudStream(response, a, watch) {
+  let buffer = '';
+  for await (const chunk of response.body) {
+    buffer += Buffer.from(chunk).toString('utf8').replace(/\r\n/g, '\n');
+    let boundary;
+    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      let event = 'message', dataText = '', id = null;
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataText += line.slice(5).trim();
+        else if (line.startsWith('id:')) id = line.slice(3).trim();
+      }
+      if (id) watch.lastEventId = id;
+      if (!dataText) continue;
+      let data;
+      try { data = JSON.parse(dataText); } catch { continue; }
+      if (applyCloudEvent(a, event, data)) return true;
+    }
+  }
+  return false;
+}
+
+async function watchCloudRun(a, runId) {
+  const prior = cloudWatches.get(a.key);
+  if (prior?.runId === runId) return;
+  if (prior) stopCloudWatch(a.key);
+  const watch = { runId, controller: null, lastEventId: null, stopped: false };
+  cloudWatches.set(a.key, watch);
+
+  while (!watch.stopped && !finishedCloudRuns.has(`${a.id}/${runId}`)) {
+    watch.controller = new AbortController();
+    try {
+      const headers = { accept: 'text/event-stream' };
+      if (watch.lastEventId) headers['last-event-id'] = watch.lastEventId;
+      const response = await cloudRequest(
+        `/v1/agents/${encodeURIComponent(a.id)}/runs/${encodeURIComponent(runId)}/stream`,
+        { headers, signal: watch.controller.signal },
+      );
+      if (await consumeCloudStream(response, a, watch)) break;
+    } catch (err) {
+      if (watch.stopped || err.name === 'AbortError') break;
+      if (err.status === 410) {
+        finishTurn(a, Date.now());
+        finishedCloudRuns.add(`${a.id}/${runId}`);
+        dirty = true;
+        break;
+      }
+      console.warn(`Cursor Cloud stream for ${a.id} failed: ${err.message}`);
+    }
+    if (!watch.stopped) await new Promise(resolve => setTimeout(resolve, CLOUD_RECONNECT_MS));
+  }
+  if (cloudWatches.get(a.key) === watch) cloudWatches.delete(a.key);
+}
+
+async function pollCloudAgents() {
+  if (!CURSOR_API_KEY || cloudPollInFlight) return;
+  cloudPollInFlight = true;
+  try {
+    const response = await cloudRequest('/v1/agents?limit=100&includeArchived=false');
+    const body = await response.json();
+    const items = Array.isArray(body.items) ? body.items : [];
+    const seen = new Set();
+    for (const item of items) {
+      if (item.env?.type !== 'cloud' || !item.id) continue;
+      const updatedAt = Date.parse(item.updatedAt) || 0;
+      if (item.status !== 'ACTIVE' && Date.now() - updatedAt > ACTIVE_MS) continue;
+      const a = ensureCloudAgent(item);
+      seen.add(a.key);
+      void hydrateCloudAgent(a);
+      if (item.status === 'ACTIVE' && item.latestRunId) {
+        if (a.state === 'waiting') { a.state = 'thinking'; a.tool = null; }
+        void watchCloudRun(a, item.latestRunId);
+      } else {
+        stopCloudWatch(a.key);
+        if (item.status === 'IDLE') finishTurn(a, updatedAt || Date.now());
+      }
+    }
+    for (const [key, a] of agents) {
+      if (a.source === 'cloud' && !seen.has(key)) {
+        stopCloudWatch(key);
+        agents.delete(key);
+        dirty = true;
+      }
+    }
+  } finally {
+    cloudPollInFlight = false;
+  }
+}
+
 // ---------- scan loop ----------
 
 function scan() {
@@ -414,6 +628,7 @@ function scan() {
   }
   const now = Date.now();
   for (const [key, a] of agents) {
+    if (a.source === 'cloud') continue;
     if (a.source === 'claude' && a.kind === 'subagent' && a.toolUseId && spawnedBy.has(a.toolUseId)) {
       a.parentKey = spawnedBy.get(a.toolUseId);
     }
@@ -529,9 +744,16 @@ server.on('error', (err) => {
 });
 
 scan();
+if (CURSOR_API_KEY) {
+  pollCloudAgents().catch(err => console.error(`Cursor Cloud poll failed: ${err.message}`));
+  setInterval(() => {
+    pollCloudAgents().catch(err => console.error(`Cursor Cloud poll failed: ${err.message}`));
+  }, CLOUD_POLL_MS);
+}
 server.listen(PORT, HOST, () => {
   console.log(`The Agent Keep is watching:`);
   console.log(`  Claude Code  ${CLAUDE_ROOT}`);
   console.log(`  Cursor       ${CURSOR_ROOT}${sqlite && fs.existsSync(CURSOR_DB) ? '' : '  (chat titles unavailable)'}`);
+  console.log(`  Cursor Cloud ${CURSOR_API_KEY ? `enabled (polling every ${CLOUD_POLL_MS / 1000}s)` : 'disabled (set CURSOR_API_KEY)'}`);
   console.log(`Open http://${HOST}:${PORT}`);
 });

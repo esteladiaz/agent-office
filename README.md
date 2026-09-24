@@ -6,6 +6,17 @@ A pixel-art medieval hall where your running Claude Code and Cursor agents, and 
 node server.mjs          # then open http://127.0.0.1:7331
 ```
 
+To include Cursor Cloud agents, create a Cursor user API key in Dashboard → API Keys and keep it in a gitignored `.env.local`:
+
+```bash
+printf 'CURSOR_API_KEY=\n' > .env.local
+chmod 600 .env.local
+# Add the key after = in an editor, then:
+node --env-file=.env.local server.mjs
+```
+
+The key stays in the Node process and is sent only to Cursor's API. It is never included in the page, `/state`, or Server-Sent Events.
+
 To try it without real agents, play fake Claude Code and Cursor sessions that spawn subagents:
 
 ```bash
@@ -16,8 +27,9 @@ node demo.mjs            # open http://127.0.0.1:7332, re-run to replay
 ## How it works
 
 - `server.mjs` checks both tools' transcript folders every 0.7s. It reads only the new lines of each file, turns them into one state per agent, and pushes that state to the page over Server-Sent Events.
+- When `CURSOR_API_KEY` is set, it checks the Cursor Cloud Agents API every 10s and opens a resumable event stream for each active run. Only agent metadata and tool names enter the hall; prompts, tool arguments, tool results and assistant text are discarded.
 - `index.html` draws the hall on a Canvas 2D. Every sprite is drawn in code with `fillRect`; there are no image assets.
-- It reads files only. Neither tool's settings or hooks are changed.
+- It never changes either tool's settings or hooks.
 
 ### Claude Code
 
@@ -34,9 +46,16 @@ node demo.mjs            # open http://127.0.0.1:7332, re-run to replay
 - MCP tools are wrapped as `CallDynamicTool` or `CallMcpTool`; the real tool name comes from `toolName`.
 - Chat titles are read from Cursor's own database (`…/Cursor/User/globalStorage/state.vscdb`, key `composerData:<id>`). The database is opened **read-only** for a single indexed lookup, at most once a minute per chat. Without it, titles fall back to `Cursor chat <id>`.
 
+### Cursor Cloud
+
+- Discovery: `GET /v1/agents` every 10s, restricted to recent or active cloud agents.
+- Live state: `GET /v1/agents/<id>/runs/<runId>/stream`, resumed with `Last-Event-ID` after a disconnect.
+- The run stream supplies tool names and completion states, so the same tome animations work without copying cloud transcripts to disk.
+- Cloud agents have purple carpets. Finished runs wait at their desks until the normal activity window expires.
+
 ## Who's who
 
-- **Monarch** (crown, cape, throne): a session. A **crimson carpet** means Claude Code; a **blue carpet** means Cursor.
+- **Monarch** (crown, cape, throne): a session. A **crimson carpet** means Claude Code, a **blue carpet** means local Cursor and a **purple carpet** means Cursor Cloud.
 - **Knight** (steel helm, plume): a `general-purpose` / `generalPurpose` subagent
 - **Ranger** (green hood): an `Explore` / `explore` subagent
 - **Wizard** (pointed hat): a `Plan` subagent
@@ -61,6 +80,7 @@ The open tome on each desk shows what the agent is doing: ink appearing (scribin
 
 - Binds to `127.0.0.1` only and rejects requests whose `Host` isn't loopback, which blocks DNS rebinding.
 - Sends only titles, subagent descriptions, project and branch names, and tool names. Prompts, code and tool output never leave the server. The first line of each Cursor subagent is kept in server memory only, to link it to its parent.
+- The Cursor API key stays in the Node process. It is never sent to the browser or written to disk by Agent Keep. `.env.local` is gitignored.
 - The default port is 7331. Avoid 4317 and 4318: they're the standard OpenTelemetry ports, and binding them on loopback can intercept a local telemetry collector.
 
 ## Settings (environment variables)
@@ -70,5 +90,7 @@ The open tome on each desk shows what the agent is doing: ink appearing (scribin
 - `CLAUDE_PROJECTS_DIR`: Claude Code transcripts (default `~/.claude/projects`)
 - `CURSOR_PROJECTS_DIR`: Cursor transcripts (default `~/.cursor/projects`)
 - `CURSOR_STATE_DB`: Cursor's database, used for chat titles; set it empty to turn title lookup off
+- `CURSOR_API_KEY`: enables Cursor Cloud agents
+- `CLOUD_POLL_MS`: Cloud discovery interval (default 10000)
 
 Neither tool documents its transcript format, so an update to either may change it. Unknown lines are skipped.

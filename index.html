@@ -46,7 +46,7 @@
     <b style="--c:var(--waiting)">awaits thee</b><span>your turn</span>
     <b style="--c:var(--blocked)">beset</b><span>stuck, permission?</span>
   </div>
-  <div class="roles">Crowned monarch = session (<span style="color:#e0b35a">crimson carpet: Claude Code</span> · <span style="color:#c9ced6">blue carpet: Cursor</span>) · Knight = general-purpose · Ranger = Explore · Wizard = Plan · Monk = any other subagent</div>
+  <div class="roles">Crowned monarch = session (<span style="color:#e0b35a">crimson carpet: Claude Code</span> · <span style="color:#c9ced6">blue carpet: Cursor</span> · <span style="color:#dfb7ff">purple carpet: Cursor Cloud</span>) · Knight = general-purpose · Ranger = Explore · Wizard = Plan · Monk = any other subagent</div>
 </header>
 <div id="stage"><canvas id="c"></canvas><div id="empty">The hall stands empty. Begin a Claude Code or Cursor agent and a new arrival shall pass through the gate.</div></div>
 <table><thead><tr><th>agent</th><th>house</th><th>project</th><th>state</th><th>tool</th><th>for</th></tr></thead><tbody id="rows"></tbody></table>
@@ -83,6 +83,7 @@ const ROLE_NAME = { monarch: 'Monarch', knight: 'Knight', ranger: 'Ranger', wiza
 const HOUSE = {
   claude: { name: 'Claude Code', trim: '#d9a441', outer: '#7a1f2b', inner: '#8f2a36' },
   cursor: { name: 'Cursor', trim: '#c9ced6', outer: '#1d2f66', inner: '#26407f' },
+  cloud: { name: 'Cursor Cloud', trim: '#dfb7ff', outer: '#4b286d', inner: '#684098' },
 };
 const houseOf = a => HOUSE[a?.source] || HOUSE.claude;
 const fmtDur = ms => ms < 60e3 ? Math.round(ms / 1e3) + 's' : ms < 3600e3 ? Math.round(ms / 60e3) + 'm' : (ms / 3600e3).toFixed(1) + 'h';

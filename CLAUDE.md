@@ -23,14 +23,7 @@ A local, zero-dependency visualizer that shows running Claude Code and Cursor ag
 
 **Cursor local agents (works on recorded history; live behavior not yet verified):** `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`, with subagents in `<id>/subagents/<subId>.jsonl`. Lines are `{role, message}` plus `{"type":"turn_ended"}`, with no timestamps, tool ids or tool results. Subagents are linked by matching their first user message to a parent `Task` call's `prompt`. Titles are read (read-only) from `…/Cursor/User/globalStorage/state.vscdb`, table `cursorDiskKV`, key `composerData:<id>`, field `name`. **Open question:** does Cursor append lines while a turn runs, or only at the end? Check by watching a file's size during a local agent run.
 
-**Cursor cloud agents (not supported yet; the next piece of work):** IDs start with `bc-`. They run on Cursor's servers (remote `/home/ubuntu/.cursor-server` workspaces) and write **no local transcript**. The only local trace is chat messages ("bubbles") synced into the same `state.vscdb` (`bubbleId:bc-<id>:<bubbleId>`, `composerData:bc-<id>`). That sync is partial and lagged: on 2026-09-23 the newest synced message was about 1h15m behind active work. It's not a reliable live signal. Per-agent files also sync to `~/Library/Application Support/Cursor/AgentStores/cursor_agent_stores/<id>/files/`; treat these as private work notes and don't display them.
-
-Options discussed, none chosen yet:
-1. Cursor's Cloud Agents API, polled every ~10s, needs a Cursor API key. **Not yet approved.** Whether a key is acceptable, and under which company account, is the user's decision. Check the endpoints against Cursor's current docs before writing any code.
-2. Read synced bubbles from `state.vscdb`. No key needed, but too laggy to be useful.
-3. Leave cloud agents out of scope.
-
-If cloud agents get added, give them their own "house" (carpet color) in `HOUSE` in `index.html`, alongside `claude` (crimson) and `cursor` (blue).
+**Cursor cloud agents:** IDs start with `bc-`. They run on Cursor's servers and write no local transcript, so Agent Keep uses the v1 Cloud Agents API only when `CURSOR_API_KEY` is set. Discovery polls `/v1/agents` every 10s; each active run uses its resumable `/stream` SSE endpoint for exact tool state. Prompts, assistant text, tool arguments and tool results are discarded. The browser receives the same safe metadata as local agents. Cloud agents use the purple `cloud` house in `index.html`.
 
 ## Known limits
 
