@@ -6,6 +6,8 @@ A pixel-art medieval hall where your running Claude Code and Cursor agents, and 
 node server.mjs          # then open http://127.0.0.1:7331
 ```
 
+On macOS you can double-click **The Agent Keep** in `/Applications` instead; see [MAC-APP.md](MAC-APP.md).
+
 To include Cursor Cloud agents, create a Cursor user API key in Dashboard → API Keys and keep it in a gitignored `.env.local`:
 
 ```bash
