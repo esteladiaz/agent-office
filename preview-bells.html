@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Keep — bell previews</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #1a1814;
+      color: #e8e4dc;
+    }
+    body {
+      max-width: 36rem;
+      margin: 2rem auto;
+      padding: 0 1.25rem 3rem;
+      line-height: 1.5;
+    }
+    h1 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      margin: 0 0 0.35rem;
+    }
+    p.lead {
+      margin: 0 0 1.5rem;
+      font-size: 0.9rem;
+      color: #a8a299;
+    }
+    .options {
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+    }
+    button {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      font: inherit;
+      font-size: 0.95rem;
+      color: inherit;
+      background: #2a2620;
+      border: 1px solid #3d3830;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { background: #332e27; border-color: #524c42; }
+    button:active { background: #3a342c; }
+    button:focus-visible { outline: 2px solid #c9a227; outline-offset: 2px; }
+    .note {
+      margin-top: 1.75rem;
+      font-size: 0.8rem;
+      color: #7a746a;
+    }
+  </style>
+</head>
+<body>
+  <h1>Agent Keep — replacement chime previews</h1>
+  <p class="lead">Click a button to play once. Web Audio only; no autoplay.</p>
+  <div class="options" id="options"></div>
+  <p class="note">Throwaway preview — not wired into the hall. Live hall chime unchanged.</p>
+  <script>
+    let audioCtx = null;
+
+    function ctx() {
+      if (!audioCtx) audioCtx = new AudioContext();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
+
+    function connectMaster(gainValue) {
+      const c = ctx();
+      const master = c.createGain();
+      master.gain.value = gainValue;
+      master.connect(c.destination);
+      return { c, master, t0: c.currentTime };
+    }
+
+    /** Inharmonic bell partials (sine), shared helper */
+    function bellPartials(c, master, freq, start, dur, partials, peakAmp) {
+      for (const p of partials) {
+        const osc = c.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq * p.ratio, start);
+        const g = c.createGain();
+        const peak = Math.max(0.0001, p.amp * peakAmp);
+        g.gain.setValueAtTime(0.0001, start);
+        g.gain.exponentialRampToValueAtTime(peak, start + 0.008);
+        g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+        osc.connect(g);
+        g.connect(master);
+        osc.start(start);
+        osc.stop(start + dur + 0.03);
+      }
+    }
+
+    const HALL_PARTIALS = [
+      { ratio: 1, amp: 1 },
+      { ratio: 2.02, amp: 0.32 },
+      { ratio: 2.65, amp: 0.18 },
+      { ratio: 3.48, amp: 0.09 },
+    ];
+
+    const previews = [
+      {
+        label: '1. Chapel bell — one low strike, long fade. Fundamental near 220–280 Hz, a few inharmonic partials, decay about 1.6s.',
+        play() {
+          const { c, master, t0 } = connectMaster(0.09);
+          const freq = 252;
+          bellPartials(c, master, freq, t0, 1.6, [
+            { ratio: 1, amp: 1 },
+            { ratio: 2.08, amp: 0.38 },
+            { ratio: 2.71, amp: 0.22 },
+            { ratio: 3.55, amp: 0.1 },
+            { ratio: 4.2, amp: 0.05 },
+          ], 1);
+        },
+      },
+      {
+        label: '2. Handbell — one bright short note. Fundamental near 880 Hz, fast decay about 0.35s.',
+        play() {
+          const { c, master, t0 } = connectMaster(0.08);
+          bellPartials(c, master, 880, t0, 0.35, [
+            { ratio: 1, amp: 1 },
+            { ratio: 2.5, amp: 0.45 },
+            { ratio: 3.2, amp: 0.2 },
+            { ratio: 4.8, amp: 0.08 },
+          ], 0.85);
+        },
+      },
+      {
+        label: '3. Parish chime — two notes a fifth apart (the current hall sound, or a clear two-note fifth if the current one is different; say which).',
+        play() {
+          // Matches index.html playWaitingChime() exactly (510 Hz → 585 Hz, ~minor third, not a perfect fifth).
+          const { c, master, t0 } = connectMaster(0.11);
+          function strike(freq, start, dur) {
+            bellPartials(c, master, freq, start, dur, HALL_PARTIALS, 1);
+          }
+          strike(510, t0, 0.42);
+          strike(585, t0 + 0.32, 0.48);
+        },
+      },
+      {
+        label: '4. Evening peal — three soft descending notes, quiet, about 1.2s total.',
+        play() {
+          const { c, master, t0 } = connectMaster(0.06);
+          const notes = [440, 370, 311];
+          const gap = 0.38;
+          const dur = 0.55;
+          notes.forEach((freq, i) => {
+            bellPartials(c, master, freq, t0 + i * gap, dur, [
+              { ratio: 1, amp: 1 },
+              { ratio: 2, amp: 0.25 },
+              { ratio: 3, amp: 0.08 },
+            ], 0.7);
+          });
+        },
+      },
+      {
+        label: '5. Gate horn — a short low horn, not a bell. Near 196 Hz with a soft brass-like overtone, about 0.5s.',
+        play() {
+          const { c, master, t0 } = connectMaster(0.07);
+          const f0 = 196;
+          const osc = c.createOscillator();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(f0, t0);
+          const osc2 = c.createOscillator();
+          osc2.type = 'sine';
+          osc2.frequency.setValueAtTime(f0 * 2, t0);
+          const g = c.createGain();
+          g.gain.setValueAtTime(0.0001, t0);
+          g.gain.exponentialRampToValueAtTime(0.9, t0 + 0.04);
+          g.gain.exponentialRampToValueAtTime(0.25, t0 + 0.15);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
+          const g2 = c.createGain();
+          g2.gain.setValueAtTime(0.0001, t0);
+          g2.gain.exponentialRampToValueAtTime(0.35, t0 + 0.03);
+          g2.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.45);
+          const lp = c.createBiquadFilter();
+          lp.type = 'lowpass';
+          lp.frequency.setValueAtTime(900, t0);
+          osc.connect(g);
+          osc2.connect(g2);
+          g.connect(lp);
+          g2.connect(lp);
+          lp.connect(master);
+          osc.start(t0);
+          osc2.start(t0);
+          osc.stop(t0 + 0.55);
+          osc2.stop(t0 + 0.55);
+        },
+      },
+      {
+        label: '6. Clapper — a dull wooden knock, very short, mostly noise plus a low thump, under 0.2s.',
+        play() {
+          const { c, master, t0 } = connectMaster(0.12);
+          const len = Math.floor(c.sampleRate * 0.12);
+          const buf = c.createBuffer(1, len, c.sampleRate);
+          const data = buf.getChannelData(0);
+          for (let i = 0; i < len; i++) {
+            const env = Math.exp(-i / (c.sampleRate * 0.025));
+            data[i] = (Math.random() * 2 - 1) * env;
+          }
+          const noise = c.createBufferSource();
+          noise.buffer = buf;
+          const ng = c.createGain();
+          ng.gain.setValueAtTime(0.55, t0);
+          ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+          const bp = c.createBiquadFilter();
+          bp.type = 'bandpass';
+          bp.frequency.value = 1200;
+          bp.Q.value = 0.6;
+          noise.connect(bp);
+          bp.connect(ng);
+          ng.connect(master);
+
+          const thump = c.createOscillator();
+          thump.type = 'sine';
+          thump.frequency.setValueAtTime(95, t0);
+          thump.frequency.exponentialRampToValueAtTime(55, t0 + 0.08);
+          const tg = c.createGain();
+          tg.gain.setValueAtTime(0.0001, t0);
+          tg.gain.exponentialRampToValueAtTime(0.85, t0 + 0.004);
+          tg.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.14);
+          thump.connect(tg);
+          tg.connect(master);
+          noise.start(t0);
+          thump.start(t0);
+          noise.stop(t0 + 0.15);
+          thump.stop(t0 + 0.15);
+        },
+      },
+    ];
+
+    const root = document.getElementById('options');
+    for (const p of previews) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = p.label;
+      btn.addEventListener('click', () => p.play());
+      root.appendChild(btn);
+    }
+  </script>
+</body>
+</html>
