@@ -153,6 +153,12 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
     assert.doesNotMatch(JSON.stringify(state), /must not leak|secret\.txt/);
   });
 
+  const tome = await (await fetch(`http://127.0.0.1:${appPort}/transcript?key=${encodeURIComponent(`cloud:${AGENT_ID}`)}`)).json();
+  assert.equal(tome.entries.some(entry => entry.role === 'scribe' && entry.text.includes('must not leak')), true);
+  assert.equal(tome.entries.some(entry => entry.role === 'tool' && entry.text.includes('read_file')), true);
+  const quiet = await (await fetch(stateUrl)).json();
+  assert.doesNotMatch(JSON.stringify(quiet), /must not leak|secret\.txt/);
+
   // Discovery can lag behind the run stream. A stale ACTIVE status must not
   // move a terminal run back from waiting to thinking on the next poll.
   await new Promise(resolve => setTimeout(resolve, 250));
@@ -161,4 +167,94 @@ test('discovers a cloud agent and follows its live tool stream', async (t) => {
     settled.agents.find(candidate => candidate.key === `cloud:${AGENT_ID}`).state,
     'waiting',
   );
+});
+
+test('a reply to a waiting cloud agent starts the next run and leaves the live feed', async (t) => {
+  const order = 'Oil the hinge and close the door.';
+  let posted = null;
+  let status = 'IDLE';
+  let runId = null;
+  const expectedAuth = `Basic ${Buffer.from(`${API_KEY}:`).toString('base64')}`;
+  const mockApi = http.createServer((req, res) => {
+    assert.equal(req.headers.authorization, expectedAuth);
+    const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'POST' && url.pathname === `/v1/agents/${PLAIN_AGENT_ID}/runs`) {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        posted = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        status = 'ACTIVE';
+        runId = 'run-reply';
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ run: { id: runId, agentId: PLAIN_AGENT_ID, status: 'CREATING' } }));
+      });
+      return;
+    }
+    if (url.pathname === '/v1/agents') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        items: [{ id: PLAIN_AGENT_ID, name: 'Waiting cloud scribe', status, latestRunId: runId, updatedAt: new Date().toISOString() }],
+      }));
+      return;
+    }
+    if (url.pathname === `/v1/agents/${PLAIN_AGENT_ID}`) {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ id: PLAIN_AGENT_ID, repos: [] }));
+      return;
+    }
+    if (url.pathname === `/v1/agents/${PLAIN_AGENT_ID}/runs` && req.method === 'GET') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ items: [] }));
+      return;
+    }
+    if (runId && url.pathname === `/v1/agents/${PLAIN_AGENT_ID}/runs/${runId}/stream`) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`event: status\ndata: ${JSON.stringify({ runId, status: 'RUNNING' })}\n\n`);
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const apiPort = await listen(mockApi);
+  t.after(() => mockApi.close());
+  const portServer = http.createServer();
+  const appPort = await listen(portServer);
+  await new Promise(resolve => portServer.close(resolve));
+  const child = spawn(process.execPath, ['server.mjs'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      ACTIVE_MINUTES: '30',
+      CLAUDE_PROJECTS_DIR: path.join(ROOT, 'test', 'missing-claude'),
+      CLOUD_POLL_MS: '100',
+      CURSOR_API_BASE_URL: `http://127.0.0.1:${apiPort}`,
+      CURSOR_API_KEY: API_KEY,
+      CURSOR_PROJECTS_DIR: path.join(ROOT, 'test', 'missing-cursor'),
+      CURSOR_STATE_DB: '',
+      PORT: String(appPort),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
+  const base = `http://127.0.0.1:${appPort}`;
+  const key = `cloud:${PLAIN_AGENT_ID}`;
+  await eventually(async () => {
+    const state = await (await fetch(`${base}/state`)).json();
+    const agent = state.agents.find(item => item.key === key);
+    assert.equal(agent?.state, 'waiting');
+    assert.equal(agent.summons, 'turn');
+  });
+  const sent = await fetch(`${base}/reply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key, text: order }),
+  });
+  assert.equal(sent.status, 202);
+  assert.equal(posted.prompt.text, order);
+  await eventually(async () => {
+    const state = await (await fetch(`${base}/state`)).json();
+    assert.equal(state.agents.find(item => item.key === key).state, 'thinking');
+    assert.doesNotMatch(JSON.stringify(state), /Oil the hinge/);
+  });
+  const tome = await (await fetch(`${base}/transcript?key=${encodeURIComponent(key)}`)).json();
+  assert.equal(tome.entries.some(entry => entry.role === 'you' && entry.text === order), true);
 });
